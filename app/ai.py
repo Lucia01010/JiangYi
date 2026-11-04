@@ -77,6 +77,8 @@ def parse_json(text: str):
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
+
+    # 兜底：提取第一个 { 到最后一个 } 的片段
     start_obj, start_arr = cleaned.find("{"), cleaned.find("[")
     starts = [s for s in (start_obj, start_arr) if s >= 0]
     if not starts:
@@ -86,14 +88,84 @@ def parse_json(text: str):
     end = max(end_obj, end_arr)
     if end <= start:
         raise AIError("模型返回的 JSON 不完整")
+    snippet = cleaned[start : end + 1]
+
+    # 第二轮尝试：如果标准解析失败，尝试修复常见的 qwen-max 松弛格式
     try:
-        return json.loads(cleaned[start : end + 1])
+        return json.loads(snippet)
+    except json.JSONDecodeError:
+        pass
+
+    fixed = _patch_json_sloppy(snippet)
+    try:
+        return json.loads(fixed)
     except json.JSONDecodeError as exc:
         raise AIError(f"模型返回的 JSON 解析失败：{exc}") from exc
 
 
+def _patch_json_sloppy(snippet: str) -> str:
+    """修复 qwen-max 等模型返回的非严格 JSON。
+
+    常见问题：questions: 后直接跟字符串序列而不是 [str, str, ...]，
+    或数组元素间用中文逗号、裸冒号、尾随逗号等。
+    """
+    patched = snippet
+
+    # 1) questions 字段后如果没有 [，补一个
+    patched = re.sub(r'(?m)("questions"\s*:\s*)([「"（])', r'\1[\2', patched)
+    # 2) 如果 questions: 后直接跟换行然后多个引号开头的字符串，中间没 [
+    patched = re.sub(
+        r'"questions"\s*:\s*\n(\s*)"',
+        r'"questions": [\1"',
+        patched,
+    )
+    # 3) 数组结尾如果多了一个裸 }，在 questions 等数组的 ] 前补
+    #    （简单策略：统计数组开始/结束）
+    # 4) 全角冒号替换
+    patched = patched.replace("：", ":")
+    # 5) 去掉尾随逗号
+    patched = re.sub(r",\s*([}\]])", r"\1", patched)
+    return patched
+
+
 def _new_qid() -> str:
     return f"q_{uuid.uuid4().hex[:8]}"
+
+
+def _fix_split_questions(questions: list[dict]) -> list[dict]:
+    """把被拆成单字的问题拼回完整句子。
+
+    判定规则：连续出现 N 条且每条长度都是 1 的中文字符（或标点），
+    说明是模型把一条完整句子逐字输出了。
+    """
+    if len(questions) <= 1:
+        return questions
+
+    i = 0
+    merged: list[dict] = []
+    while i < len(questions):
+        chunk = []
+        j = i
+        while j < len(questions) and len(questions[j]["text"]) == 1 and re.match(
+            r"[\u4e00-\u9fff，。、！？；：（）《》……—、、]", questions[j]["text"]
+        ):
+            chunk.append(questions[j])
+            j += 1
+        # 只有连续 ≥4 个单字才算拆分；否则保留原样（比如问题列表里单独的"？"）
+        if len(chunk) >= 4:
+            merged_text = "".join(q["text"] for q in chunk)
+            merged.append(
+                {
+                    "id": _new_qid(),
+                    "text": merged_text,
+                    "asked": False,
+                    "source": chunk[0]["source"],
+                }
+            )
+        else:
+            merged.extend(chunk)
+        i = j
+    return merged
 
 
 def normalize_outline(raw: dict, source: str = "ai") -> dict:
@@ -119,6 +191,10 @@ def normalize_outline(raw: dict, source: str = "ai") -> dict:
                     "source": source,
                 }
             )
+
+        # qwen-max / 部分模型会把完整句子拆成单字数组，这里自动拼回
+        questions = _fix_split_questions(questions)
+
         title = str(section.get("title", "") or "").strip()
         if not title and not questions:
             continue
