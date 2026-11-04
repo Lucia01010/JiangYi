@@ -1,14 +1,19 @@
+import base64
+import hashlib
+import hmac
 import io
 import json
 import mimetypes
-import re
+import os
 import shutil
 import threading
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+import httpx
+from fastapi import Body, FastAPI, File, Form, HTTPException, Header, Request, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -22,6 +27,77 @@ JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
 
 store.init_db()
+
+
+# ---- 轻量鉴权：HMAC + Base64，不引入额外依赖 ---------------------------------
+# token 结构：base64(json_payload) "." base64(hmac_hex(payload, SECRET))
+# SECRET 优先从 TOKEN_SECRET 环境变量读取，否则进程内随机生成（重启失效）
+_TOKEN_SECRET = os.environ.get("TOKEN_SECRET") or uuid.uuid4().hex.encode()
+
+
+def _sign(payload_bytes: bytes) -> str:
+    return hmac.new(_TOKEN_SECRET, payload_bytes, hashlib.sha256).hexdigest()
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _b64url_decode(s: str) -> bytes:
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def make_token(role: str, identity: str, ttl_seconds: int = 86400 * 30) -> str:
+    payload = {"role": role, "identity": identity, "iat": int(time.time()), "exp": int(time.time()) + ttl_seconds}
+    encoded = _b64url(json.dumps(payload).encode())
+    sig = _sign(encoded.encode())
+    return f"{encoded}.{sig}"
+
+
+def parse_token(token: str | None) -> dict | None:
+    if not token or "." not in token:
+        return None
+    encoded, sig = token.rsplit(".", 1)
+    expected = _sign(encoded.encode())
+    if not hmac.compare_digest(expected, sig):
+        return None
+    try:
+        payload = json.loads(_b64url_decode(encoded))
+    except Exception:
+        return None
+    if payload.get("exp", 0) < int(time.time()):
+        return None
+    return payload
+
+
+def _extract_openid(request: Request) -> str | None:
+    """从 X-OpenID 头或 Bearer token 中提取受访者 openid。"""
+    direct = request.headers.get("x-openid", "").strip()
+    if direct:
+        return direct
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        payload = parse_token(auth[7:].strip())
+        if payload and payload.get("role") == "user":
+            return payload.get("identity")
+    return None
+
+
+def _require_openid(request: Request) -> str:
+    openid = _extract_openid(request)
+    if not openid:
+        raise HTTPException(status_code=401, detail="缺少受访者身份标识，请先通过微信登录")
+    return openid
+
+
+def _require_admin(request: Request) -> None:
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="请先登录开发者后台")
+    payload = parse_token(auth[7:].strip())
+    if not payload or payload.get("role") != "admin":
+        raise HTTPException(status_code=401, detail="开发者身份校验失败")
 
 
 def _interview_or_404(item_id: str) -> dict:
@@ -91,11 +167,23 @@ def list_interviews():
 
 
 @app.post("/api/interviews")
-def create_interview(payload: dict = Body(default={})):
+def create_interview(request: Request, payload: dict = Body(default={})):
     profile = payload.get("profile") or {}
     if not isinstance(profile, dict):
         raise HTTPException(status_code=400, detail="口述人信息格式不正确")
-    item = store.create_interview(profile, payload.get("title"))
+    # 如果请求里带了 openid（通过 header 或 token），自动绑定
+    openid = _extract_openid(request) or str(payload.get("openid") or "").strip()
+    consent = bool(payload.get("consent_accepted"))
+    if openid and not consent:
+        # 小程序端创建档案必须有知情同意
+        raise HTTPException(status_code=400, detail="请先勾选并确认知情同意")
+    item = store.create_interview(
+        profile=profile,
+        title=payload.get("title"),
+        openid=openid,
+        consent_accepted=consent,
+        consent_at=store.now_iso() if consent else None,
+    )
     return item
 
 
@@ -421,6 +509,169 @@ def test_settings(payload: dict = Body(default={})):
         probe["provider"] = payload["provider"]
     return ai.test_connection(probe)
 
+
+# -------- 登录鉴权 -------------------------------------------------------------
+
+@app.post("/api/auth/wechat")
+async def wechat_login(payload: dict = Body(default={})):
+    """微信小程序 wx.login() 返回的 code 换 openid，下发 user token。"""
+    settings = config.load_settings()
+    appid = settings.get("wechat_appid", "").strip()
+    secret = settings.get("wechat_secret", "").strip()
+    code = str(payload.get("code") or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="缺少 code 参数，请在小程序内先 wx.login()")
+    if not appid or not secret:
+        # 未配置微信参数时，开发模式下允许测试 code 直接作为 openid
+        if os.environ.get("DEV_MODE") == "1" or not os.environ.get("WECHAT_APPID"):
+            openid = f"dev_{code[:8]}"
+        else:
+            raise HTTPException(status_code=400, detail="服务端尚未配置微信 AppID/Secret")
+    else:
+        url = (
+            f"https://api.weixin.qq.com/sns/jscode2session"
+            f"?appid={appid}&secret={secret}&js_code={code}&grant_type=authorization_code"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"微信接口请求失败：{exc}")
+        data = resp.json()
+        if "openid" not in data:
+            raise HTTPException(status_code=400, detail=f"微信返回错误：{data}")
+        openid = data["openid"]
+    token = make_token("user", openid, ttl_seconds=86400 * 90)
+    return {"openid": openid, "token": token, "role": "user"}
+
+
+@app.post("/api/admin/login")
+def admin_login(payload: dict = Body(default={})):
+    """开发者后台登录，返回 admin token。"""
+    settings = config.load_settings()
+    expected = settings.get("admin_password", "").strip()
+    submitted = str(payload.get("password") or "").strip()
+    if not expected:
+        raise HTTPException(status_code=400, detail="服务端未设置管理员密码，请在 settings.json 或 ADMIN_PASSWORD 环境变量中配置")
+    if not submitted:
+        raise HTTPException(status_code=400, detail="请提交密码")
+    if not hmac.compare_digest(expected, submitted):
+        raise HTTPException(status_code=401, detail="密码错误")
+    token = make_token("admin", "admin", ttl_seconds=86400 * 30)
+    return {"token": token, "role": "admin"}
+
+
+# -------- 受访者（小程序）专属接口 ---------------------------------------------
+
+@app.get("/api/my/interviews")
+def my_interviews(request: Request):
+    openid = _require_openid(request)
+    items = store.list_interviews(openid=openid)
+    return {"items": [_summary(item) for item in items]}
+
+
+@app.post("/api/my/interviews")
+def my_create_interview(request: Request, payload: dict = Body(default={})):
+    """受访者在小程序里创建自己的档案。需要 openid + 知情同意。"""
+    openid = _require_openid(request)
+    profile = payload.get("profile") or {}
+    consent = bool(payload.get("consent_accepted"))
+    if not consent:
+        raise HTTPException(status_code=400, detail="请先勾选并确认知情同意")
+    item = store.create_interview(
+        profile=profile,
+        title=payload.get("title"),
+        openid=openid,
+        consent_accepted=True,
+        consent_at=store.now_iso(),
+    )
+    return item
+
+
+@app.get("/api/my/interviews/{item_id}")
+def my_get_interview(request: Request, item_id: str):
+    openid = _require_openid(request)
+    item = store.get_interview_for(item_id, openid)
+    if not item:
+        raise HTTPException(status_code=404, detail="档案不存在或不属于你")
+    return item
+
+
+@app.delete("/api/my/interviews/{item_id}")
+def my_delete_interview(request: Request, item_id: str):
+    """受访者主动删除自己的档案（物理删除录音 + 数据库记录）。"""
+    openid = _require_openid(request)
+    ok = store.delete_interview(item_id, openid=openid)
+    if not ok:
+        raise HTTPException(status_code=404, detail="档案不存在或不属于你")
+    return {"ok": True, "message": "已删除你的档案，录音文件也已清理。"}
+
+
+@app.get("/api/my/interviews/{item_id}/audio")
+def my_get_audio(request: Request, item_id: str):
+    openid = _require_openid(request)
+    item = store.get_interview_for(item_id, openid)
+    if not item:
+        raise HTTPException(status_code=404, detail="档案不存在或不属于你")
+    path = item.get("audio_path")
+    if not path or not Path(path).exists():
+        raise HTTPException(status_code=404, detail="该访谈还没有录音")
+    media_type = mimetypes.guess_type(path)[0] or "audio/webm"
+    return FileResponse(path, media_type=media_type, filename=item.get("audio_name") or Path(path).name)
+
+
+@app.get("/api/my/interviews/{item_id}/export/{fmt}")
+def my_export_interview(request: Request, item_id: str, fmt: str):
+    openid = _require_openid(request)
+    item = store.get_interview_for(item_id, openid)
+    if not item:
+        raise HTTPException(status_code=404, detail="档案不存在或不属于你")
+    if not (item.get("archive") or {}).get("sections"):
+        # 没有归档稿时，退而给转写稿的纯文本
+        text = ((item.get("transcript") or {}).get("text") or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="该档案既没有口述档案也没有转写稿")
+        title = item.get("title") or "口述档案"
+        if fmt == "txt":
+            return Response(
+                content=text.encode("utf-8"),
+                media_type="text/plain; charset=utf-8",
+                headers=_content_disposition(export.safe_filename(title, "txt")),
+            )
+        raise HTTPException(status_code=400, detail="请先生成口述档案或导出为 txt 纯文本")
+    return _export_common(item, fmt)
+
+
+def _export_common(item: dict, fmt: str):
+    fmt = fmt.lower()
+    title = (item.get("archive") or {}).get("title") or item.get("title")
+    if fmt == "md":
+        content = export.to_markdown(item)
+        return Response(
+            content=content.encode("utf-8"),
+            media_type="text/markdown; charset=utf-8",
+            headers=_content_disposition(export.safe_filename(title, "md")),
+        )
+    if fmt == "html":
+        content = export.to_html(item)
+        return Response(
+            content=content.encode("utf-8"),
+            media_type="text/html; charset=utf-8",
+            headers=_content_disposition(export.safe_filename(title, "html")),
+        )
+    if fmt == "docx":
+        buffer = io.BytesIO()
+        export.to_docx(item, buffer)
+        return Response(
+            content=buffer.getvalue(),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers=_content_disposition(export.safe_filename(title, "docx")),
+        )
+    raise HTTPException(status_code=400, detail="不支持的导出格式")
+
+
+# -------- 开发者端（web）鉴权：管理员登录后才能访问完整档案接口 --------------
+# 不强制拦截旧接口，方便开发调试；生产环境可启用全局中间件
 
 @app.get("/")
 def index():
