@@ -18,7 +18,7 @@ App.blankInterview = function blankInterview() {
 App.STEP_META = [
   { step: 1, title: '基础信息', desc: '口述人资料', stage: '基础信息', sub: '先留下可核对的身份与经历线索' },
   { step: 2, title: '访谈提纲', desc: 'AI 起草 · 人工可改', stage: '访谈提纲', sub: '所有问题都可以人工增删、改写与勾选' },
-  { step: 3, title: '录音与转写', desc: '本地 Whisper', stage: '录音与转写', sub: '录音保存在本机，语音转写完全离线' },
+  { step: 3, title: '录音与转写', desc: '录音并转成文字', stage: '录音与转写', sub: '' },
   { step: 4, title: '访谈追问', desc: '顺着讲述深挖', stage: '访谈追问', sub: '从转写内容中生成可以马上使用的追问' },
   { step: 5, title: '口述档案', desc: '生成与导出', stage: '口述档案', sub: '整理成一份可归档、可导出的正文' },
 ];
@@ -115,7 +115,6 @@ App.paintWorkspace = function paintWorkspace() {
             <div class="mini-row"><span>转 写</span><span>${transcript.text ? `${transcript.text.length} 字` : '尚未转写'}</span></div>
           </div>
         </div>
-        <div class="storage-note">${UI.icon('shield')}<span>录音、转写与档案保存在本机 E 盘；仅提纲、追问与档案整理会调用云端 AI。</span></div>
       </aside>
       <section class="stage">
         <div class="stage-head">

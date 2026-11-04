@@ -44,7 +44,6 @@ App.renderRecordStep = function renderRecordStep() {
           </div>
         </div>
         <div class="record-hint">
-          ${UI.icon('shield')}<span>录音直接写入本机 E 盘，不会上传云端</span>
           <button class="btn btn-ghost btn-sm" type="button" data-upload-trigger>${UI.icon('upload')}<span>上传已有录音</span></button>
           <input type="file" id="audioFileInput" accept="audio/*,.webm,.m4a,.mp3,.wav,.ogg,.flac" hidden>
         </div>
@@ -93,7 +92,7 @@ App.renderRecordStep = function renderRecordStep() {
         </div>` : `
         <div class="banner banner-warn">
           ${UI.icon('wave')}
-          <div>${hasAudio ? '录音已就绪。点击右侧「开始转写」，语音识别完全在本机离线完成，首次加载模型会稍慢。' : '请先录音或上传一段访谈音频，再进行语音转写。'}</div>
+          <div>${hasAudio ? '录音已就绪，点击右侧「开始转写」' : '请先录音或上传一段访谈音频，再进行语音转写。'}</div>
         </div>`}
     </div>
 
@@ -297,14 +296,14 @@ App.stopRecording = async function stopRecording() {
   const form = new FormData();
   form.append('file', result.blob, `recording.${extension}`);
   form.append('duration', String(result.duration || 0));
-  UI.showLoading('正在保存录音', '录音文件正在写入本机 E 盘');
+  UI.showLoading('正在保存录音');
   try {
     await API.uploadAudio(item.id, form);
     const updated = await API.get(item.id);
     this.state.current = updated;
     UI.hideLoading();
     this.paintWorkspace();
-    UI.toast('录音已保存，开始离线转写', 'success', 2800);
+    UI.toast('录音已保存，开始转写', 'success', 2800);
     this.startTranscription(true);
   } catch (error) {
     UI.hideLoading();
@@ -330,7 +329,7 @@ App.uploadAudioFile = async function uploadAudioFile(file) {
     this.state.current = updated;
     UI.hideLoading();
     this.paintWorkspace();
-    UI.toast('音频已保存，开始离线转写', 'success', 2600);
+    UI.toast('音频已保存，开始转写', 'success', 2600);
     this.startTranscription(true);
   } catch (error) {
     UI.hideLoading();
@@ -519,7 +518,7 @@ App.saveTranscript = async function saveTranscript(silent) {
 App.runQuickFollowups = async function runQuickFollowups(blob, text) {
   const item = this.state.current;
   if (!item || !item.id) return;
-  UI.showLoading('正在分析当前片段', blob ? '先在本机转写片段，再生成追问，可能需要一点时间' : 'AI 正在阅读刚才的内容');
+  UI.showLoading('正在分析当前片段', blob ? '正在转写片段并生成追问' : 'AI 正在阅读刚才的内容');
   try {
     let payload;
     if (blob) {
@@ -749,7 +748,6 @@ App.renderArchiveStep = function renderArchiveStep() {
         </div>
         <div class="audio-actions">
           <button class="btn btn-primary" data-generate-archive>${UI.icon('sparkles')}<span>生成口述档案</span></button>
-          <span class="hint">未配置云端 AI 时，将使用本地模板先整理出一份底稿。</span>
         </div>
       </div>`;
   }

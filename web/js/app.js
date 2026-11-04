@@ -19,6 +19,10 @@ const App = {
   recorder: null,
 
   async boot() {
+    // 每次启动强制回到首页，避免浏览器恢复到上次的 hash（如 #/settings）
+    if (!window.location.hash || !window.location.hash.startsWith('#/interview/')) {
+      window.location.hash = '#/';
+    }
     this.bindChrome();
     try {
       const [settings, system] = await Promise.all([API.settings(), API.system()]);
@@ -365,7 +369,6 @@ const App = {
         <button class="btn btn-ghost btn-sm ws-back" data-back>${UI.icon('arrow-left')}<span>档案库</span></button>
         <div class="ws-title-wrap">
           <h1 class="stage-title" style="font-size:30px;">系统设置</h1>
-          <div class="ws-meta">云端 AI 负责生成提纲、追问与档案；语音转写完全在本机离线完成。</div>
         </div>
       </div>
       <div class="settings-grid fade-in">
@@ -400,7 +403,6 @@ const App = {
             <label>API Key</label>
             <div class="field">
               <input class="input" id="setApiKey" type="password" autocomplete="new-password" placeholder="${settings.has_key ? '已保存，留空则保持不变' : '输入你的 API Key'}">
-              <span class="field-hint">密钥仅保存在本机 ${UI.escape(storage.data_dir || 'data')}\\settings.json，不会上传到其他位置。</span>
             </div>
           </div>
           <div class="settings-row">
@@ -420,7 +422,6 @@ const App = {
 
         <section class="settings-card">
           <h2>本地转写与存储</h2>
-          <p class="sub">录音、转写与档案均保存在本机项目目录，语音识别不上传云端。</p>
           <div class="settings-row">
             <label>Whisper 模型</label>
             <div class="field">
@@ -458,7 +459,6 @@ const App = {
           </div>
           <div class="settings-note">
             当前转写模型：${UI.escape(system.whisper_model || settings.whisper_model || 'small')} · ${system.whisper_ready ? '模型已就绪' : '首次转写时自动下载'}。
-            所有缓存、模型和临时文件均指向 E 盘项目目录。
           </div>
           <div style="margin-top:22px;">
             <h3 style="font-size:16px; margin-bottom:10px;">存储位置</h3>
@@ -550,7 +550,7 @@ const App = {
       clearBtn.onclick = async () => {
         const ok = await UI.confirmDialog({
           title: '清除 API Key？',
-          message: '清除后无法调用云端 AI，提纲、追问与档案将退回本地模板。',
+          message: '清除后将无法调用云端 AI 能力。',
           confirmText: '清除',
           danger: true,
         });
