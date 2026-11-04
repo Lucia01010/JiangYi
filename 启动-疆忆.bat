@@ -19,7 +19,6 @@ if not exist ".venv\Scripts\python.exe" (
 echo.
 echo  疆忆 · 援疆口述档案智能采集系统
 echo  本地地址：http://127.0.0.1:8766
-echo  录音与档案保存在：%~dp0data
 echo  关闭本窗口即停止服务。
 echo.
 
